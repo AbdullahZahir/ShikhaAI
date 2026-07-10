@@ -125,4 +125,4 @@ shikhaai/
 
 ## License
 
-This project does not yet specify a license. If you plan to share or accept contributions, consider adding one (e.g. the [MIT License](https://choosealicense.com/licenses/mit/)).
+This project follows the MIT License.
