@@ -1,0 +1,21 @@
+# Core AI SDK
+openai>=1.55.0
+
+# Loads OPENAI_API_KEY from a local .env file
+python-dotenv>=1.0.1
+
+# Modern-looking Tkinter widgets
+customtkinter>=5.2.2
+
+# Image handling for icons, thumbnails, and the app logo
+Pillow>=10.0.0
+
+# Used by the procedural background-music generator (music.py)
+numpy>=1.24
+
+# Video/audio assembly (v2 API - see README for the v1 -> v2 notes)
+moviepy>=2.1.0
+
+# Playback engine bindings. Requires the separate VLC application to be
+# installed on the machine (see README) - this package alone is not enough.
+python-vlc>=3.0.20123
