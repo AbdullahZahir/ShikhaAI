@@ -1,26 +1,5 @@
 """
 All calls out to OpenAI, plus the moviepy assembly step, live here.
-
-Notable fixes vs. the original script:
-  - gpt-3.5-turbo -> configurable current model (gpt-4.1-mini by default).
-    gpt-3.5-turbo is a legacy model OpenAI steers people away from now.
-  - dall-e-3 -> gpt-image-1-mini / gpt-image-1.5 (the GPT Image family).
-    DALL-E 2 and 3 were removed from the OpenAI API on May 12, 2026, so the
-    original code would fail outright on a fresh API key.
-  - GPT Image models always return base64 (`b64_json`), never a URL, so the
-    old "requests.get(url)" download step is gone - we decode bytes directly.
-  - tts-1 -> gpt-4o-mini-tts, which supports an `instructions` field so each
-    podcast host can actually sound different (energetic vs. calm) instead
-    of just using a different preset voice.
-  - Long scripts are now split into chunks before TTS. tts-1 has a 4096
-    character limit and gpt-4o-mini-tts has a 2000 *token* limit; the
-    original code sent the whole script in one call, which would silently
-    fail or get truncated on anything longer than a couple of paragraphs.
-  - The podcast line parser now tolerates markdown bold ("**Shimmer:**"),
-    stray spaces, and multi-line turns, instead of requiring an exact
-    "Shimmer:" prefix on every single line.
-  - Every network call is wrapped so failures raise a friendly
-    GenerationError instead of an unhandled traceback that freezes the UI.
 """
 
 import base64
