@@ -21,6 +21,7 @@ PODCASTS_DIR = os.path.join(LIBRARY_DIR, "podcasts")
 PROJECTS_DIR = os.path.join(APP_DIR, "projects")  # persistent scene images + narration per video, for the storyboard/regenerate-scene feature
 HISTORY_FILE = os.path.join(APP_DIR, "history.json")
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+QUIZ_RESULTS_FILE = os.path.join(APP_DIR, "quiz_results.json")
 ICON_PNG = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
 ICON_ICO = os.path.join(os.path.dirname(__file__), "assets", "logo.ico")
 BRAND_LOCKUP_PNG = os.path.join(os.path.dirname(__file__), "assets", "brand_lockup.png")
@@ -74,24 +75,30 @@ GRADE_OPTIONS = {
 MODEL_TIERS = {
     "Budget": {
         "description": "Cheapest option. Great for testing.",
+        "cost_hint": "Lowest cost per lesson",
         "chat_model": "gpt-4.1-nano",
         "image_model": "gpt-image-1-mini",
         "image_quality": "low",
         "tts_model": "gpt-4o-mini-tts",
+        "transcribe_model": "whisper-1",
     },
     "Balanced (recommended)": {
         "description": "Best quality-for-cost balance for everyday use.",
+        "cost_hint": "A short video typically costs well under $0.50",
         "chat_model": "gpt-4.1-mini",
         "image_model": "gpt-image-1-mini",
         "image_quality": "medium",
         "tts_model": "gpt-4o-mini-tts",
+        "transcribe_model": "whisper-1",
     },
     "Higher quality": {
         "description": "Better writing and sharper images, costs more per video.",
+        "cost_hint": "Costs more per video than Balanced",
         "chat_model": "gpt-5.4-mini",
         "image_model": "gpt-image-1.5",
         "image_quality": "medium",
         "tts_model": "gpt-4o-mini-tts",
+        "transcribe_model": "whisper-1",
     },
 }
 DEFAULT_TIER = "Balanced (recommended)"
@@ -129,6 +136,29 @@ PODCAST_LINE_CHUNK_CHARS = 1800
 # nothing is downloaded or bundled. Off by default; opt in from Settings.
 MUSIC_ENABLED_DEFAULT = False
 MUSIC_VOLUME_DEFAULT = 0.12   # quiet bed under dialogue, 0.0-0.4 sane range
+
+# --------------------------------------------------------------------------
+# Accessibility & learning support (see the Accessibility page)
+# --------------------------------------------------------------------------
+# ADHD-friendly captions: short, bold phrases with the spoken word highlighted.
+CAPTION_SIZES = {"Medium": 18, "Large": 22, "Extra large": 28}
+DEFAULT_CAPTION_SIZE = "Large"
+DEFAULT_CAPTION_WORDS = 4     # words on screen at once; fewer = easier to follow
+
+# Fonts offered for reading text (script, captions, quiz). Only the ones
+# actually installed on the machine are listed - Atkinson Hyperlegible,
+# Lexend and OpenDyslexic are free downloads designed for easier reading.
+READING_FONTS = ["Segoe UI", "Atkinson Hyperlegible", "Lexend", "OpenDyslexic", "Verdana", "Comic Sans MS", "Arial"]
+SCRIPT_TEXT_SIZES = {"Standard": 13, "Large": 16, "Extra large": 19}
+
+# Timed quizzes
+QUIZ_QUESTION_COUNTS = ["5", "8", "10", "15"]
+QUIZ_TIME_LIMITS = {
+    "15 seconds": 15, "30 seconds": 30, "45 seconds": 45, "60 seconds": 60,
+    "90 seconds": 90, "No time limit": 0,
+}
+QUIZ_EXTRA_TIME = {"Standard time": 1.0, "1.5x time": 1.5, "2x time": 2.0}
+QUIZ_FEEDBACK_MODES = ["After each question", "At the end"]
 
 # --------------------------------------------------------------------------
 # Misc

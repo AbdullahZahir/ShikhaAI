@@ -75,6 +75,30 @@ class SettingsStore:
         "max_scenes": config.MAX_VIDEO_SCENES,
         "music_enabled": config.MUSIC_ENABLED_DEFAULT,
         "music_volume": config.MUSIC_VOLUME_DEFAULT,
+        # ADHD-friendly captions
+        "captions_enabled": True,
+        "caption_size": config.DEFAULT_CAPTION_SIZE,
+        "caption_words": config.DEFAULT_CAPTION_WORDS,
+        "caption_highlight": True,
+        "caption_bold_starts": False,
+        # Sensory & motion
+        "reduce_motion": False,
+        "calm_visuals": False,
+        # Lesson style
+        "literal_language": False,
+        "predictable_structure": False,
+        "bite_size": False,
+        "calm_hosts": False,
+        # Reading
+        "reading_font": config.FONT_FAMILY,
+        "script_text_size": "Standard",
+        "line_spacing": False,
+        # Quizzes
+        "quiz_questions": "5",
+        "quiz_time_limit": "30 seconds",
+        "quiz_extra_time": "Standard time",
+        "quiz_feedback": config.QUIZ_FEEDBACK_MODES[0],
+        "quiz_calm_timer": False,
     }
 
     def __init__(self, path=None):
@@ -95,3 +119,34 @@ class SettingsStore:
         self.data.update(kwargs)
         with _lock:
             _write_json_atomic(self.path, self.data)
+
+
+class QuizResultsStore:
+    """Every finished quiz's score, so progress can be tracked over time."""
+
+    def __init__(self, path=None):
+        self.path = path or config.QUIZ_RESULTS_FILE
+        with _lock:
+            self.data = _read_json(self.path, [])
+        if not isinstance(self.data, list):
+            self.data = []
+
+    def add(self, topic, level, score, total, seconds_per_question, elapsed_seconds, timed_out):
+        entry = {
+            "topic": topic,
+            "level": level,
+            "score": score,
+            "total": total,
+            "seconds_per_question": seconds_per_question,
+            "elapsed_seconds": round(elapsed_seconds),
+            "timed_out": timed_out,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        with _lock:
+            self.data.append(entry)
+            _write_json_atomic(self.path, self.data)
+        return entry
+
+    def recent(self, limit=8):
+        """Newest-first."""
+        return list(reversed(self.data[-limit:]))

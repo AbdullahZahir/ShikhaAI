@@ -2,7 +2,7 @@
 Small custom-drawn UI components that plain CustomTkinter doesn't provide
 out of the box: a gradient-filled button, toast notifications (replacing
 blocking OS-native messageboxes), an animated spinner, a gradient divider
-line, and a friendlier "empty state" block.
+line, a friendlier "empty state" block, and the ADHD-friendly caption bar.
 
 These are drawn with plain tkinter Canvas + PIL-rendered images rather than
 system fonts baked into a bitmap, so there's no dependency on any particular
@@ -12,13 +12,20 @@ font handling.
 
 import os
 import tkinter as tk
+import tkinter.font
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 import customtkinter as ctk
 
+from . import captions as captions_mod
 from . import config
 from . import icons as icon_mod
+
+# Accessibility > "Reduce motion". Checked at event time rather than when a
+# widget is built, so flipping it takes effect everywhere immediately: hover
+# effects stop growing/shrinking and the spinner holds still.
+REDUCE_MOTION = False
 
 
 # --------------------------------------------------------------------------
@@ -111,10 +118,12 @@ def add_hover_grow(widget, base_width, base_height, growth=4, duration_ms=110, s
         step(0)
 
     def on_enter(_e=None):
-        animate_to(base_width + growth, base_height + growth)
+        if not REDUCE_MOTION:
+            animate_to(base_width + growth, base_height + growth)
 
     def on_leave(_e=None):
-        animate_to(base_width, base_height)
+        if (state["w"], state["h"]) != (base_width, base_height):
+            animate_to(base_width, base_height)
 
     widget.bind("<Enter>", on_enter, add="+")
     widget.bind("<Leave>", on_leave, add="+")
@@ -186,7 +195,8 @@ class GradientButton(tk.Canvas):
             return
         self._hovering = True
         self.configure(cursor="hand2")
-        self._animate_to(self.base_width + self.growth, self.base_height + self.growth)
+        growth = 0 if REDUCE_MOTION else self.growth
+        self._animate_to(self.base_width + growth, self.base_height + growth)
 
     def _on_leave(self, _event=None):
         if not self._enabled:
@@ -214,7 +224,7 @@ class GradientButton(tk.Canvas):
             if i < self.steps:
                 self.after(step_delay, lambda: step(i + 1))
 
-        step(0)
+        step(self.steps if REDUCE_MOTION else 0)
 
     def _on_click(self, _event=None):
         if self._enabled and self._command:
@@ -284,7 +294,8 @@ class Spinner(ctk.CTkLabel):
         img = icon_mod.get_rotated_icon("loader-circle", self._color, self._size, self._angle)
         if img is not None:
             self.configure(image=img)
-        self._angle = (self._angle + 30) % 360
+        if not REDUCE_MOTION:
+            self._angle = (self._angle + 30) % 360
         self.after(90, self._tick)
 
 
@@ -302,6 +313,102 @@ class EmptyState(ctk.CTkFrame):
             ctk.CTkLabel(self, text=subtitle, font=ctk.CTkFont(config.FONT_FAMILY, 12),
                          text_color=config.COLORS["text_faint"], wraplength=320,
                          justify="center").pack(pady=(4, 36))
+
+
+# --------------------------------------------------------------------------
+# ADHD-friendly caption bar
+# --------------------------------------------------------------------------
+class CaptionBar(ctk.CTkFrame):
+    """One short phrase at a time, big and centered, with the word being
+    spoken highlighted so attention has one clear place to land. Words
+    already said stay bright, words still to come are dimmed.
+
+    Built on a plain tk.Text (rather than a label) because one line has to
+    mix colors and weights - e.g. bolding just the start of each word.
+    """
+
+    def __init__(self, parent, placeholder="Captions will appear here while the lesson plays."):
+        super().__init__(parent, fg_color=config.COLORS["bg_alt"], corner_radius=12)
+        self._placeholder = placeholder
+        # width=1: let the layout decide the width - Text otherwise asks for 80
+        # characters, which at caption sizes would squeeze its neighbours out.
+        self._text = tk.Text(
+            self, height=2, width=1, wrap="word", bd=0, highlightthickness=0, relief="flat",
+            bg=config.COLORS["bg_alt"], fg=config.COLORS["text"], cursor="arrow",
+            padx=12, pady=8, takefocus=0, exportselection=False,
+            selectbackground=config.COLORS["bg_alt"], inactiveselectbackground=config.COLORS["bg_alt"],
+        )
+        self._text.pack(fill="both", expand=True, padx=8, pady=6)
+        self._shown = None
+        self._cue = None
+        self._word_index = 0
+        self.set_style(config.FONT_FAMILY, config.CAPTION_SIZES[config.DEFAULT_CAPTION_SIZE])
+
+    def set_style(self, family, size, highlight=True, bold_starts=False):
+        colors = config.COLORS
+        base_weight = "normal" if bold_starts else "bold"
+        self._family, self._size, self._bold_starts = family, size, bold_starts
+        self._line_px = tk.font.Font(family=family, size=size, weight="bold").metrics("linespace")
+        self._text.configure(font=(family, size, base_weight))
+        self._text.tag_configure("center", justify="center")
+        self._text.tag_configure("spoken", foreground=colors["text"], font=(family, size, base_weight))
+        self._text.tag_configure("current", foreground=colors["accent2"] if highlight else colors["text"],
+                                 font=(family, size, base_weight))
+        self._text.tag_configure("upcoming", foreground=colors["text_dim"] if highlight else colors["text"],
+                                 font=(family, size, base_weight))
+        self._text.tag_configure("start", font=(family, size, "bold"))
+        self._text.tag_configure("speaker", foreground=colors["accent2"], font=(family, max(10, size // 2), "bold"))
+        self._text.tag_configure("placeholder", foreground=colors["text_faint"], font=(family, 12))
+        self._text.tag_raise("start")
+        # Redraw whatever was on screen in the new style.
+        self._shown = None
+        if self._cue is not None:
+            self.show(self._cue, self._word_index)
+        else:
+            self.clear()
+
+    def show(self, cue, word_index):
+        key = (id(cue), word_index)
+        if key == self._shown:
+            return
+        self._shown, self._cue, self._word_index = key, cue, word_index
+        self._write(self._insert_cue, cue, word_index)
+
+    def clear(self, message=None):
+        """Show `message` in small faint text - the placeholder by default, or
+        "" for a blank bar (e.g. a pause between phrases mid-lesson)."""
+        message = self._placeholder if message is None else message
+        if self._shown == ("clear", message):
+            return
+        self._shown, self._cue = ("clear", message), None
+        self._write(lambda: message and self._text.insert("end", message, ("placeholder",)))
+
+    def _insert_cue(self, cue, word_index):
+        words = cue["words"]
+        if cue.get("speaker"):
+            self._text.insert("end", cue["speaker"].upper() + "   ", ("speaker",))
+        for k, word in enumerate(words):
+            tag = "spoken" if k < word_index else "current" if k == word_index else "upcoming"
+            if self._bold_starts:
+                head, tail = captions_mod.bold_split(word["w"])
+                self._text.insert("end", head, (tag, "start"))
+                self._text.insert("end", tail, (tag,))
+            else:
+                self._text.insert("end", word["w"], (tag,))
+            if k < len(words) - 1:
+                self._text.insert("end", " ", (tag,))
+
+    def _write(self, fill, *args):
+        text = self._text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        fill(*args)
+        text.tag_add("center", "1.0", "end")
+        # A one-line caption sits in the middle of the two-line box instead of at the top.
+        lines = text.count("1.0", "end -1c", "displaylines")
+        lines = lines[0] if isinstance(lines, tuple) else (lines or 0)
+        text.tag_configure("center", spacing1=self._line_px // 2 if lines <= 1 else 0)
+        text.configure(state="disabled")
 
 
 # --------------------------------------------------------------------------

@@ -14,6 +14,7 @@ Fixes two real bugs from the original app:
 
 import os
 import sys
+import time
 
 try:
     import vlc
@@ -35,6 +36,7 @@ class VLCPlayer:
         self.error = None
         self.instance = None
         self.player = None
+        self._clock = None  # (last VLC time in ms, wall-clock time it was first seen) - see get_time()
 
         if vlc is None:
             self.error = str(_VLC_IMPORT_ERROR)
@@ -84,3 +86,33 @@ class VLCPlayer:
 
     def is_playing(self):
         return bool(self.available and self.player.is_playing())
+
+    def get_time(self):
+        """Current playback position in seconds, or None if nothing is loaded/playing.
+
+        VLC only refreshes its clock every few hundred milliseconds, which
+        makes word-by-word caption highlighting stutter, so between refreshes
+        the position is extrapolated from the wall clock and playback rate.
+        """
+        if not self.available:
+            return None
+        ms = self.player.get_time()
+        if ms is None or ms < 0:
+            self._clock = None
+            return None
+        now = time.monotonic()
+        if self._clock is None or self._clock[0] != ms or not self.player.is_playing():
+            self._clock = (ms, now)
+            return ms / 1000.0
+        drift = min(0.5, (now - self._clock[1]) * (self.player.get_rate() or 1.0))
+        return ms / 1000.0 + drift
+
+    def get_length(self):
+        """Media length in seconds (0 until VLC has parsed the file)."""
+        if not self.available:
+            return 0.0
+        ms = self.player.get_length()
+        return ms / 1000.0 if ms and ms > 0 else 0.0
+
+    def has_ended(self):
+        return bool(self.available and self.player.get_state() == vlc.State.Ended)

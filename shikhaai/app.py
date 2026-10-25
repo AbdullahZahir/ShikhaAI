@@ -18,6 +18,11 @@ Architecture:
     app and revisiting an item from the Library. Podcasts don't need this
     (no per-scene images), so their working files stay in a temp folder
     that's cleaned up immediately after generation.
+  - Captions are saved as word timings next to each lesson (see
+    captions.py) and drawn by a second `self.after(...)` loop that reads the
+    player's position, so they stay in sync at any playback speed.
+  - The Quiz page lives in quiz.py; the Accessibility page's options are
+    stored in SettingsStore and applied live (see `_apply_accessibility`).
 """
 
 import glob
@@ -28,12 +33,14 @@ import shutil
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import uuid
 
 import customtkinter as ctk
 
-from . import ai_services, components, config, icons, music, storage
+from . import ai_services, captions, components, config, icons, music, storage
 from .player import VLCPlayer
+from .quiz import QuizPage
 
 ctk.set_appearance_mode("dark")
 
@@ -46,6 +53,32 @@ def _icon(name, color="text", size=18):
     return icons.get_icon(name, color, size)
 
 
+# Accessibility > Quick setup. Each preset only turns supports on (so they
+# can be combined); "Reset to defaults" is the way back.
+_A11Y_PRESETS = {
+    "ADHD focus": {
+        "captions_enabled": True, "caption_words": 3, "caption_highlight": True,
+        "caption_bold_starts": True, "bite_size": True, "predictable_structure": True,
+        "quiz_extra_time": "1.5x time",
+    },
+    "Autism / sensory-friendly": {
+        "captions_enabled": True, "reduce_motion": True, "calm_visuals": True, "calm_hosts": True,
+        "literal_language": True, "predictable_structure": True, "quiz_calm_timer": True,
+    },
+    "Dyslexia-friendly": {
+        "captions_enabled": True, "caption_size": "Extra large", "script_text_size": "Large",
+        "line_spacing": True, "quiz_extra_time": "1.5x time",
+    },
+}
+_A11Y_KEYS = [
+    "captions_enabled", "caption_size", "caption_words", "caption_highlight", "caption_bold_starts",
+    "reduce_motion", "calm_visuals", "literal_language", "predictable_structure", "bite_size",
+    "calm_hosts", "reading_font", "script_text_size", "line_spacing", "quiz_extra_time", "quiz_calm_timer",
+]
+# Fonts tried, in order, when the Dyslexia-friendly preset picks a reading font.
+_DYSLEXIA_FONTS = ["Atkinson Hyperlegible", "Lexend", "OpenDyslexic", "Verdana"]
+
+
 class ShikhaAIApp(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=config.COLORS["bg"])
@@ -56,17 +89,29 @@ class ShikhaAIApp(ctk.CTk):
 
         self.history = storage.HistoryStore()
         self.settings = storage.SettingsStore()
+        self.quiz_results = storage.QuizResultsStore()
         self.toasts = components.ToastManager(self)
+        components.REDUCE_MOTION = bool(self.settings.get("reduce_motion"))
 
         self.mode = "video"                 # "video" | "podcast"
+        self.current_page = None
         self.cancel_event = threading.Event()
         self.worker_thread = None
         self.progress_queue = queue.Queue()
         self.last_video_path = None
         self.last_podcast_path = None
         self.current_video_project = None   # dict: dir/images/scenes/narration_path/out_path
+        self.current_lesson = None          # library entry (+ "kind") the Create page is showing - for "Quiz me"
         self.storyboard_regen_buttons = []
         self._voice_preview_busy = False
+        self.video_speed = 1.0
+
+        # Captions, per player ("video" / "podcast"): the saved word timings,
+        # the phrase track built from them, and - for older lessons with no
+        # captions file - the media path still waiting on an estimate.
+        self.caption_words = {"video": None, "podcast": None}
+        self.caption_tracks = {"video": None, "podcast": None}
+        self._caption_pending = {"video": None, "podcast": None}
 
         self.video_player = VLCPlayer()
         self.podcast_player = VLCPlayer()
@@ -75,8 +120,11 @@ class ShikhaAIApp(ctk.CTk):
             print(f"[ShikhaAI] Playback disabled: {self.video_player.error}", file=sys.stderr)
 
         self._build_layout()
+        self._apply_accessibility()
         self._show_page("create")
         self.after(100, self._poll_queue)
+        self.after(100, self._tick_captions)
+        self.after(500, self._tick_caption_preview)
 
     # ------------------------------------------------------------------
     # Window chrome
@@ -134,7 +182,9 @@ class ShikhaAIApp(ctk.CTk):
 
         self.pages = {}
         self.pages["create"] = self._build_create_page(self.pages_container)
+        self.pages["quiz"] = QuizPage(self.pages_container, self)
         self.pages["library"] = self._build_library_page(self.pages_container)
+        self.pages["accessibility"] = self._build_accessibility_page(self.pages_container)
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
 
@@ -161,7 +211,10 @@ class ShikhaAIApp(ctk.CTk):
         ).pack(anchor="w", pady=(4, 0))
 
         self.nav_buttons = {}
-        nav_items = [("create", "Create", "sparkles"), ("library", "Library", "library-big")]
+        nav_items = [
+            ("create", "Create", "sparkles"), ("quiz", "Quiz", "list-checks"),
+            ("library", "Library", "library-big"), ("accessibility", "Accessibility", "person-standing"),
+        ]
         for i, (key, label, icon_name) in enumerate(nav_items):
             btn = ctk.CTkButton(
                 sidebar, text="  " + label, anchor="w", font=_font(14),
@@ -192,6 +245,9 @@ class ShikhaAIApp(ctk.CTk):
         settings_btn.grid(row=7, column=0, sticky="ew", padx=14, pady=(2, 18))
         components.add_hover_grow(settings_btn, 0, 40, growth=3, axis="height")
     def _show_page(self, key):
+        if self.current_page == "quiz" and key != "quiz":
+            self.pages["quiz"].on_hide()
+        self.current_page = key
         for k, btn in self.nav_buttons.items():
             active = k == key
             btn.configure(
@@ -201,6 +257,8 @@ class ShikhaAIApp(ctk.CTk):
         self.pages[key].tkraise()
         if key == "library":
             self._refresh_library()
+        elif key == "quiz":
+            self.pages["quiz"].on_show()
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -324,6 +382,14 @@ class ShikhaAIApp(ctk.CTk):
         self.progress_bar.set(0)
         # gridded/ungridded dynamically while a job is running
 
+        # So the cost of a lesson is clear before anything is generated.
+        self.cost_hint = ctk.CTkLabel(
+            input_card, text="", image=_icon("zap", "text_faint", 16), compound="left",
+            font=_font(11), text_color=config.COLORS["text_faint"], anchor="w",
+        )
+        self.cost_hint.grid(row=5, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 14))
+        self._refresh_cost_hint()
+
         # ---- output area ----
         output_row = ctk.CTkFrame(scroll, fg_color="transparent")
         output_row.grid(row=1, column=0, sticky="ew", padx=28, pady=(0, 12))
@@ -338,11 +404,18 @@ class ShikhaAIApp(ctk.CTk):
         ctk.CTkLabel(
             script_card, text="Script", font=_font(13, "bold"), text_color=config.COLORS["text_dim"],
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4))
+        self.quiz_me_btn = ctk.CTkButton(
+            script_card, text=" Quiz me", image=_icon("list-checks", "text", 16), width=96, height=28,
+            font=_font(12), fg_color=config.COLORS["surface_hi"], hover_color=config.COLORS["border"],
+            state="disabled", command=self._on_quiz_me_clicked,
+        )
+        self.quiz_me_btn.grid(row=0, column=1, sticky="e", padx=18, pady=(12, 4))
+        components.add_hover_grow(self.quiz_me_btn, 96, 28, growth=3)
         self.script_box = ctk.CTkTextbox(
-            script_card, font=_font(13), fg_color=config.COLORS["bg_alt"],
+            script_card, font=self.reading_font(13), fg_color=config.COLORS["bg_alt"],
             text_color=config.COLORS["text"], corner_radius=10, wrap="word",
         )
-        self.script_box.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self.script_box.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=18, pady=(0, 18))
         self.script_box.configure(state="disabled")
 
         self.media_card = self._card(output_row)
@@ -372,6 +445,8 @@ class ShikhaAIApp(ctk.CTk):
         self.video_surface = tk.Frame(self.video_panel_frame, bg="black", height=400)
         self.video_surface.pack(fill="x", padx=18)
         self.video_surface.pack_propagate(False)
+        # Packed/unpacked by _apply_caption_prefs() depending on the captions setting.
+        self.video_captions = components.CaptionBar(self.video_panel_frame)
 
         video_controls = ctk.CTkFrame(self.video_panel_frame, fg_color="transparent")
         video_controls.pack(fill="x", padx=18, pady=12)
@@ -400,6 +475,20 @@ class ShikhaAIApp(ctk.CTk):
         self.resume_btn.pack(side="left", padx=6)
         components.add_hover_grow(self.resume_btn, 96, 36)
 
+        # Videos can be slowed down (or sped up) too, same as podcasts.
+        video_speed_row = ctk.CTkFrame(self.video_panel_frame, fg_color="transparent")
+        video_speed_row.pack(fill="x", padx=18, pady=(0, 14))
+        ctk.CTkLabel(video_speed_row, text="Speed", font=_font(11), text_color=config.COLORS["text_faint"]).pack(side="left")
+        for spd in ["0.75", "1.0", "1.25", "1.5", "2.0"]:
+            spd_btn = ctk.CTkButton(
+                video_speed_row, text=f"{spd}x", width=40, height=26, font=_font(11),
+                fg_color=config.COLORS["surface_hi"], hover_color=config.COLORS["accent"],
+                command=lambda s=spd: self._set_video_speed(s),
+            )
+            spd_btn.pack(side="left", padx=3)
+            components.add_hover_grow(spd_btn, 40, 26, growth=3)
+        self.video_cc_btn = self._build_cc_button(video_speed_row)
+
         # --- podcast sub-panel ---
         self.podcast_panel_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.podcast_panel_frame.grid(row=1, column=0, sticky="nsew")
@@ -408,10 +497,12 @@ class ShikhaAIApp(ctk.CTk):
         )
         podcast_icon_area.pack(fill="x", padx=18)
         podcast_icon_area.pack_propagate(False)
+        self.podcast_icon_area = podcast_icon_area
         self.podcast_label = ctk.CTkLabel(
             podcast_icon_area, text="", image=_icon("headphones", "accent2", 56),
         )
         self.podcast_label.pack(expand=True)
+        self.podcast_captions = components.CaptionBar(self.podcast_panel_frame)
         self.podcast_name_label = ctk.CTkLabel(
             self.podcast_panel_frame, text="No podcast generated yet", font=_font(12),
             text_color=config.COLORS["text_dim"], wraplength=260,
@@ -457,8 +548,20 @@ class ShikhaAIApp(ctk.CTk):
             )
             spd_btn.pack(side="left", padx=3)
             components.add_hover_grow(spd_btn, 40, 26, growth=3)
+        self.podcast_cc_btn = self._build_cc_button(speed_row)
 
         self._show_video_panel()
+
+    def _build_cc_button(self, parent):
+        """Quick on/off toggle for captions, next to the playback speed buttons."""
+        btn = ctk.CTkButton(
+            parent, text=" CC", image=_icon("captions", "text", 16), width=60, height=26, font=_font(11, "bold"),
+            fg_color=config.COLORS["surface_hi"], hover_color=config.COLORS["accent_hover"],
+            command=self._toggle_captions,
+        )
+        btn.pack(side="right")
+        components.add_hover_grow(btn, 60, 26, growth=3)
+        return btn
 
     def _show_video_panel(self):
         self.video_panel_frame.tkraise()
@@ -588,22 +691,25 @@ class ShikhaAIApp(ctk.CTk):
             return
 
         tier = config.MODEL_TIERS[self.settings.get("tier")]
+        calm_visuals = bool(self.settings.get("calm_visuals"))
+        ken_burns = not self.settings.get("reduce_motion")
         self._set_generating_ui(True, working_text="Regenerating...")
         self.worker_thread = threading.Thread(
-            target=self._run_regenerate_scene, args=(project, index, tier), daemon=True,
+            target=self._run_regenerate_scene, args=(project, index, tier, calm_visuals, ken_burns), daemon=True,
         )
         self.worker_thread.start()
 
-    def _run_regenerate_scene(self, project, index, tier):
+    def _run_regenerate_scene(self, project, index, tier, calm_visuals, ken_burns):
         try:
             scene_text = project["scenes"][index]
             image_path = project["images"][index]
             self._progress_cb(0, 1, f"Regenerating scene {index + 1}...")
-            ai_services.regenerate_scene_image(scene_text, image_path, tier["image_model"], tier["image_quality"])
+            ai_services.regenerate_scene_image(scene_text, image_path, tier["image_model"], tier["image_quality"],
+                                               calm_visuals=calm_visuals)
             self._progress_cb(0, 1, "Rebuilding video...")
             ai_services.assemble_video(
                 project["images"], project["narration_path"], project["out_path"],
-                progress_cb=self._progress_cb,
+                progress_cb=self._progress_cb, ken_burns=ken_burns,
             )
             self.progress_queue.put(("scene_regenerated", index, project["out_path"]))
         except ai_services.GenerationError as exc:
@@ -730,12 +836,21 @@ class ShikhaAIApp(ctk.CTk):
                 text_color=config.COLORS["text_dim"], anchor="w",
             ).pack(anchor="w")
 
+            quiz_btn = ctk.CTkButton(
+                card, text=" Quiz", image=_icon("list-checks", "text", 14), width=90, height=32,
+                fg_color=config.COLORS["accent_soft"], hover_color=config.COLORS["accent_hover"],
+                text_color=config.COLORS["text"],
+                command=lambda e=entry, k=kind: self._quiz_on_lesson(dict(e, kind=k)),
+            )
+            quiz_btn.grid(row=0, column=1, padx=(16, 0))
+            components.add_hover_grow(quiz_btn, 90, 32, growth=4)
+
             play_btn = ctk.CTkButton(
                 card, text=" Play", image=_icon("play", "on_accent", 14), width=90, height=32,
                 fg_color=config.COLORS["accent"], hover_color=config.COLORS["accent_hover"],
                 command=lambda e=entry, k=kind: self._play_from_library(k, e),
             )
-            play_btn.grid(row=0, column=1, padx=16)
+            play_btn.grid(row=0, column=2, padx=16)
             components.add_hover_grow(play_btn, 90, 32, growth=4)
 
     def _play_from_library(self, kind, entry):
@@ -748,6 +863,7 @@ class ShikhaAIApp(ctk.CTk):
             except OSError:
                 pass
         self._set_script_text(script_text or "(script not available for this item)")
+        self._set_current_lesson(dict(entry, kind=kind))
 
         if kind == "videos":
             self.mode_switch.set("🎥  Video + Script")
@@ -760,6 +876,21 @@ class ShikhaAIApp(ctk.CTk):
             self._on_mode_switch("🎧  Podcast")
             self._show_page("create")
             self._load_podcast(entry["path"], os.path.basename(entry["path"]))
+
+    # ------------------------------------------------------------------
+    # Quiz entry points
+    # ------------------------------------------------------------------
+    def _set_current_lesson(self, lesson):
+        self.current_lesson = lesson
+        self.quiz_me_btn.configure(state="normal" if lesson else "disabled")
+
+    def _on_quiz_me_clicked(self):
+        if self.current_lesson:
+            self._quiz_on_lesson(self.current_lesson)
+
+    def _quiz_on_lesson(self, lesson):
+        self._show_page("quiz")
+        self.pages["quiz"].use_lesson(lesson)
 
     # ------------------------------------------------------------------
     # Mode / grade dropdown handlers
@@ -776,6 +907,288 @@ class ShikhaAIApp(ctk.CTk):
         options = config.GRADE_OPTIONS[level]
         self.specific_menu.configure(values=options)
         self.specific_var.set(options[0])
+
+    # ------------------------------------------------------------------
+    # Accessibility page
+    # ------------------------------------------------------------------
+    def _build_accessibility_page(self, parent):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(2, weight=1)
+        self._a11y_vars = {}
+
+        header = ctk.CTkFrame(page, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 8))
+        ctk.CTkLabel(
+            header, text="Accessibility & learning support", font=_font(22, "bold"),
+            text_color=config.COLORS["text"],
+        ).pack(side="left")
+        ctk.CTkLabel(header, text="Changes save automatically", font=_font(12),
+                     text_color=config.COLORS["text_dim"]).pack(side="right")
+
+        components.GradientDivider(page, height=3).grid(row=1, column=0, sticky="ew", padx=28, pady=(0, 14))
+
+        scroll = ctk.CTkScrollableFrame(
+            page, fg_color="transparent", scrollbar_button_color=config.COLORS["surface_hi"],
+        )
+        scroll.grid(row=2, column=0, sticky="nsew")
+        scroll.grid_columnconfigure((0, 1), weight=1, uniform="a11y")
+
+        # ---- quick setup ----
+        quick = self._a11y_card(
+            scroll, 0, 0, "person-standing", "Quick setup",
+            "Turn on a group of supports in one click, then fine-tune anything below. "
+            "Presets add to each other, so they can be combined.", columnspan=2,
+        )
+        preset_row = ctk.CTkFrame(quick, fg_color="transparent")
+        preset_row.pack(fill="x", padx=18, pady=(0, 16))
+        for name, icon_name in [("ADHD focus", "zap"), ("Autism / sensory-friendly", "eye"),
+                                ("Dyslexia-friendly", "type")]:
+            preset_btn = ctk.CTkButton(
+                preset_row, text=" " + name, image=_icon(icon_name, "text", 16), height=34, font=_font(12, "bold"),
+                fg_color=config.COLORS["surface_hi"], hover_color=config.COLORS["accent"],
+                command=lambda n=name: self._apply_a11y_preset(n),
+            )
+            preset_btn.pack(side="left", padx=(0, 8))
+            components.add_hover_grow(preset_btn, 0, 34, growth=3, axis="height")
+        reset_btn = ctk.CTkButton(
+            preset_row, text=" Reset to defaults", image=_icon("rotate-ccw", "text_dim", 16), height=34,
+            font=_font(12), fg_color="transparent", hover_color=config.COLORS["surface_hi"],
+            text_color=config.COLORS["text_dim"], command=self._reset_a11y,
+        )
+        reset_btn.pack(side="right")
+
+        # ---- ADHD-friendly captions ----
+        cap = self._a11y_card(
+            scroll, 1, 0, "captions", "ADHD-friendly captions",
+            "A few words at a time, big and bold, with the word being spoken highlighted - so attention "
+            "has one clear place to land. Shown under videos and podcasts.",
+        )
+        self.a11y_preview = components.CaptionBar(cap, placeholder=None)
+        self.a11y_preview.pack(fill="x", padx=18, pady=(0, 6))
+        self._caption_preview_t = 0.0
+        self._a11y_switch(cap, "captions_enabled", "Show captions while lessons play")
+        self._a11y_option(cap, "caption_size", "Caption size", list(config.CAPTION_SIZES.keys()))
+        self._a11y_option(cap, "caption_words", "Words on screen at once", ["2", "3", "4", "5", "6", "8"], cast=int)
+        self._a11y_switch(cap, "caption_highlight", "Highlight each word as it's spoken")
+        self._a11y_switch(cap, "caption_bold_starts", "Bold word starts",
+                          "Bolds the first part of every word to give the eye an anchor point.")
+        self._a11y_spacer(cap)
+
+        # ---- sensory & motion ----
+        sense = self._a11y_card(
+            scroll, 1, 1, "eye", "Sensory & motion",
+            "Lower-stimulation settings for autistic learners, and anyone who finds busy screens or "
+            "sudden sounds tiring.",
+        )
+        self._a11y_switch(sense, "reduce_motion", "Reduce motion",
+                          "New videos use still scenes instead of slow pan-and-zoom, and nothing in the "
+                          "app grows, spins or slides.")
+        self._a11y_switch(sense, "calm_visuals", "Calm illustrations",
+                          "Soft colors and simple, uncluttered scenes in new videos.")
+        self._a11y_switch(sense, "calm_hosts", "Calm podcast hosts",
+                          "Both hosts speak gently and evenly - no shouting, teasing or sudden jokes.")
+        self._a11y_note(sense, "Background music is already off unless you turn it on in Settings.",
+                        pady=(10, 0))
+        self._a11y_spacer(sense)
+
+        # ---- lesson style ----
+        style = self._a11y_card(
+            scroll, 2, 0, "sparkles", "Clear, predictable lessons",
+            "Changes how new scripts, podcasts and quiz questions are written.",
+        )
+        self._a11y_switch(style, "literal_language", "Clear, literal language",
+                          "No idioms, sarcasm or figures of speech, and every new word is explained "
+                          "the first time it's used.")
+        self._a11y_switch(style, "predictable_structure", "Predictable structure",
+                          "Each lesson says what's coming, goes step by step, and ends with a short recap.")
+        self._a11y_switch(style, "bite_size", "Bite-size lessons",
+                          "About a minute long, one idea per scene - easier to stay with from start to finish.")
+        self._a11y_spacer(style)
+
+        # ---- reading ----
+        read = self._a11y_card(
+            scroll, 2, 1, "type", "Reading",
+            "For dyslexic learners and anyone who reads more easily with bigger, roomier text. "
+            "Applies to the script, captions and quizzes.",
+        )
+        self._a11y_option(read, "reading_font", "Reading font", self._reading_font_choices(), width=200)
+        self._a11y_option(read, "script_text_size", "Script text size", list(config.SCRIPT_TEXT_SIZES.keys()))
+        self._a11y_switch(read, "line_spacing", "Extra line spacing in the script")
+        self._a11y_note(read, "Atkinson Hyperlegible, Lexend and OpenDyslexic are free fonts made for easier "
+                              "reading. Install any of them and they'll appear in this list.", pady=(10, 0))
+        self._a11y_spacer(read)
+
+        # ---- quizzes ----
+        quiz = self._a11y_card(
+            scroll, 3, 0, "timer", "Quizzes",
+            "Testing accommodations for timed quizzes.",
+        )
+        self._a11y_option(quiz, "quiz_extra_time", "Extended time", list(config.QUIZ_EXTRA_TIME.keys()))
+        self._a11y_switch(quiz, "quiz_calm_timer", "Calm timer",
+                          "A quiet progress bar instead of a ticking countdown, with no warning colors "
+                          "as time runs low.")
+        self._a11y_note(quiz, "Quizzes can always be paused - pausing hides the question, so a break is a real "
+                              "break.", pady=(10, 0))
+        self._a11y_spacer(quiz)
+
+        about = self._a11y_card(
+            scroll, 3, 1, "circle-alert", "A learning tool, not a clinical one",
+            "ShikhaAI doesn't diagnose or treat any condition. These supports work best alongside the "
+            "teachers, families and specialists who know each learner.",
+        )
+        self._a11y_spacer(about)
+        ctk.CTkFrame(scroll, fg_color="transparent", height=12).grid(row=4, column=0)
+
+        return page
+
+    def _a11y_card(self, parent, row, column, icon_name, title, subtitle, columnspan=1):
+        card = self._card(parent)
+        card.grid(row=row, column=column, columnspan=columnspan, sticky="nsew", pady=(0, 12),
+                  padx=(28 if column == 0 else 6, 28 if column + columnspan == 2 else 6))
+        ctk.CTkLabel(
+            card, text=" " + title, image=_icon(icon_name, "accent2", 20), compound="left",
+            font=_font(14, "bold"), text_color=config.COLORS["text"],
+        ).pack(anchor="w", padx=18, pady=(16, 2))
+        self._a11y_note(card, subtitle, size=12, color="text_dim", pady=(0, 10))
+        return card
+
+    def _a11y_note(self, card, text, size=11, color="text_faint", padx=(18, 18), pady=(0, 2)):
+        """A wrapping line of explanatory text that re-wraps as the card resizes."""
+        label = ctk.CTkLabel(card, text=text, font=_font(size), text_color=config.COLORS[color],
+                             justify="left", anchor="w", wraplength=360)
+        label.pack(anchor="w", fill="x", padx=padx, pady=pady)
+
+        def rewrap(event):
+            scale = ctk.ScalingTracker.get_widget_scaling(card)
+            label.configure(wraplength=max(160, event.width / scale - padx[0] - padx[1] - 8))
+        card.bind("<Configure>", rewrap, add="+")
+        return label
+
+    def _a11y_spacer(self, card):
+        ctk.CTkFrame(card, fg_color="transparent", height=14).pack()
+
+    def _a11y_switch(self, card, key, label, hint=None):
+        var = tk.BooleanVar(value=bool(self.settings.get(key)))
+        ctk.CTkSwitch(
+            card, text=label, variable=var, onvalue=True, offvalue=False, font=_font(12),
+            progress_color=config.COLORS["accent"], text_color=config.COLORS["text_dim"],
+            command=lambda: self._update_a11y({key: bool(var.get())}),
+        ).pack(anchor="w", padx=18, pady=(8, 0))
+        if hint:
+            self._a11y_note(card, hint, padx=(66, 18))
+        self._a11y_vars[key] = var
+
+    def _a11y_option(self, card, key, label, values, cast=str, width=170):
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(8, 0))
+        ctk.CTkLabel(row, text=label, font=_font(12), text_color=config.COLORS["text_dim"]).pack(side="left")
+        var = tk.StringVar(value=str(self.settings.get(key)))
+        ctk.CTkOptionMenu(
+            row, values=values, variable=var, width=width, font=_font(12),
+            fg_color=config.COLORS["bg_alt"], button_color=config.COLORS["surface_hi"],
+            button_hover_color=config.COLORS["accent"], dropdown_fg_color=config.COLORS["surface"],
+            text_color=config.COLORS["text"], command=lambda v: self._update_a11y({key: cast(v)}),
+        ).pack(side="right")
+        self._a11y_vars[key] = var
+
+    def _apply_a11y_preset(self, name):
+        changes = dict(_A11Y_PRESETS[name])
+        if name == "Dyslexia-friendly":
+            font = next((f for f in _DYSLEXIA_FONTS if f in self._installed_fonts()), None)
+            if font:
+                changes["reading_font"] = font
+        self._update_a11y(changes)
+        self.toasts.show(f"{name} supports turned on.", kind="success", duration_ms=2500)
+
+    def _reset_a11y(self):
+        self._update_a11y({k: storage.SettingsStore.DEFAULTS[k] for k in _A11Y_KEYS})
+        self.toasts.show("Accessibility settings reset to defaults.", kind="info", duration_ms=2500)
+
+    def _update_a11y(self, changes):
+        """Save accessibility settings, sync the page's controls, and apply them right away."""
+        self.settings.update(**changes)
+        for key, value in changes.items():
+            var = self._a11y_vars.get(key)
+            if var is not None:
+                var.set(value if isinstance(var, tk.BooleanVar) else str(value))
+        self._apply_accessibility()
+
+    def _installed_fonts(self):
+        if not hasattr(self, "_font_families"):
+            self._font_families = set(tkfont.families(self))
+        return self._font_families
+
+    def _reading_font_choices(self):
+        installed = self._installed_fonts()
+        choices = [f for f in config.READING_FONTS if f in installed]
+        current = self.settings.get("reading_font")
+        if current not in choices:
+            choices.insert(0, current)
+        return choices
+
+    def reading_font(self, size=13, weight="normal"):
+        """Font for text meant to be read (script, captions, quiz) - set on the Accessibility page."""
+        return ctk.CTkFont(family=self.settings.get("reading_font") or config.FONT_FAMILY, size=size, weight=weight)
+
+    def lesson_style(self):
+        """The Accessibility page's lesson-writing options, in the shape ai_services expects."""
+        return {k: bool(self.settings.get(k))
+                for k in ("literal_language", "predictable_structure", "bite_size", "calm_hosts")}
+
+    def _apply_accessibility(self):
+        """Push the Accessibility settings out to everything they affect."""
+        components.REDUCE_MOTION = bool(self.settings.get("reduce_motion"))
+        self._apply_reading_prefs()
+        self._apply_caption_prefs()
+        self.pages["quiz"].apply_prefs()
+
+    def _apply_reading_prefs(self):
+        size = config.SCRIPT_TEXT_SIZES.get(self.settings.get("script_text_size"), 13)
+        spacing = round(size * 0.5) if self.settings.get("line_spacing") else 0
+        self.script_box.configure(font=self.reading_font(size), spacing1=spacing // 2, spacing2=spacing,
+                                  spacing3=spacing // 2)
+
+    def _apply_caption_prefs(self):
+        enabled = bool(self.settings.get("captions_enabled"))
+        style = dict(
+            family=self.settings.get("reading_font") or config.FONT_FAMILY,
+            size=config.CAPTION_SIZES.get(self.settings.get("caption_size"), 22),
+            highlight=bool(self.settings.get("caption_highlight")),
+            bold_starts=bool(self.settings.get("caption_bold_starts")),
+        )
+        for bar, above in ((self.video_captions, self.video_surface), (self.podcast_captions, self.podcast_icon_area)):
+            bar.set_style(**style)
+            if enabled and not bar.winfo_manager():
+                bar.pack(fill="x", padx=18, pady=(10, 0), after=above)
+            elif not enabled and bar.winfo_manager():
+                bar.pack_forget()
+        for btn in (self.video_cc_btn, self.podcast_cc_btn):
+            btn.configure(fg_color=config.COLORS["accent"] if enabled else config.COLORS["surface_hi"])
+        for kind in ("video", "podcast"):
+            self._rebuild_caption_track(kind)
+
+        self.a11y_preview.set_style(**style)
+        self._preview_track = captions.CaptionTrack(
+            captions.estimate_words("Plants make their own food from sunlight, water and air.", 0, 5.0),
+            int(self.settings.get("caption_words")),
+        )
+
+    def _toggle_captions(self):
+        self._update_a11y({"captions_enabled": not self.settings.get("captions_enabled")})
+
+    def _tick_caption_preview(self):
+        """Plays the sample caption on the Accessibility page, so style changes can be seen."""
+        try:
+            if self.current_page == "accessibility":
+                self._caption_preview_t = (self._caption_preview_t + 0.15) % 6.5
+                cue_index, word_index = self._preview_track.at(self._caption_preview_t)
+                if cue_index is None:
+                    self.a11y_preview.clear("")
+                else:
+                    self.a11y_preview.show(self._preview_track.cues[cue_index], word_index)
+        finally:
+            self.after(150, self._tick_caption_preview)
 
     # ------------------------------------------------------------------
     # Settings dialog
@@ -877,6 +1290,7 @@ class ShikhaAIApp(ctk.CTk):
                 tier=tier_var.get(), narrator_voice=voice_var.get(), max_scenes=max_scenes,
                 music_enabled=bool(music_enabled_var.get()), music_volume=float(volume_var.get()),
             )
+            self._refresh_cost_hint()
             dialog.destroy()
             self.toasts.show("Settings saved.", kind="success", duration_ms=2500)
 
@@ -890,6 +1304,11 @@ class ShikhaAIApp(ctk.CTk):
                                              fg_color=config.COLORS["surface_hi"], hover_color=config.COLORS["border"])
         cancel_settings_btn.pack(side="right", padx=8)
         components.add_hover_grow(cancel_settings_btn, 80, 28, growth=4)
+
+    def _refresh_cost_hint(self):
+        tier_name = self.settings.get("tier")
+        tier = config.MODEL_TIERS.get(tier_name, config.MODEL_TIERS[config.DEFAULT_TIER])
+        self.cost_hint.configure(text=f"  {tier_name} tier  ·  {tier['cost_hint']}  ·  change it in Settings")
 
     def _preview_voice(self, voice, tier_key, button, spinner):
         if self._voice_preview_busy:
@@ -930,16 +1349,21 @@ class ShikhaAIApp(ctk.CTk):
         max_scenes = self.settings.get("max_scenes")
         music_enabled = self.settings.get("music_enabled")
         music_volume = self.settings.get("music_volume")
+        style = self.lesson_style()
+        calm_visuals = bool(self.settings.get("calm_visuals"))
+        ken_burns = not self.settings.get("reduce_motion")
 
         self.cancel_event.clear()
         self._set_generating_ui(True)
         self._set_script_text("Generating... please wait.")
+        self._set_current_lesson(None)
         self._render_storyboard(None)
         self.current_video_project = None
 
         self.worker_thread = threading.Thread(
             target=self._run_pipeline,
-            args=(mode, topic, level, tier, narrator_voice, max_scenes, music_enabled, music_volume),
+            args=(mode, topic, level, tier, narrator_voice, max_scenes, music_enabled, music_volume,
+                  style, calm_visuals, ken_burns),
             daemon=True,
         )
         self.worker_thread.start()
@@ -978,7 +1402,8 @@ class ShikhaAIApp(ctk.CTk):
     def _progress_cb(self, i, total, message):
         self.progress_queue.put(("progress", i, total, message))
 
-    def _run_pipeline(self, mode, topic, level, tier, narrator_voice, max_scenes, music_enabled, music_volume):
+    def _run_pipeline(self, mode, topic, level, tier, narrator_voice, max_scenes, music_enabled, music_volume,
+                      style, calm_visuals, ken_burns):
         gen_id = uuid.uuid4().hex
         try:
             if mode == "video":
@@ -986,12 +1411,12 @@ class ShikhaAIApp(ctk.CTk):
                 os.makedirs(project_dir, exist_ok=True)
 
                 self._progress_cb(0, 1, "Writing script...")
-                script = ai_services.generate_script(topic, level, tier["chat_model"])
+                script = ai_services.generate_script(topic, level, tier["chat_model"], style=style)
                 self.progress_queue.put(("script", script))
 
                 images, scenes = ai_services.generate_images(
                     script, project_dir, tier["image_model"], tier["image_quality"], max_scenes,
-                    progress_cb=self._progress_cb, cancel_event=self.cancel_event,
+                    progress_cb=self._progress_cb, cancel_event=self.cancel_event, calm_visuals=calm_visuals,
                 )
                 with open(os.path.join(project_dir, "scenes.json"), "w", encoding="utf-8") as f:
                     json.dump(scenes, f)
@@ -1004,31 +1429,38 @@ class ShikhaAIApp(ctk.CTk):
                 # Videos are narration-only by design (no background music option
                 # here) - it competed with the narration and just sounded like noise.
 
+                self._progress_cb(0, 1, "Timing captions...")
+                caption_words = self._time_video_captions(script, narration_final, tier)
+
                 out_path = os.path.join(config.VIDEOS_DIR, f"{gen_id}.mp4")
-                ai_services.assemble_video(images, narration_final, out_path, progress_cb=self._progress_cb)
+                ai_services.assemble_video(images, narration_final, out_path, progress_cb=self._progress_cb,
+                                           ken_burns=ken_burns)
 
                 sidecar = os.path.splitext(out_path)[0] + ".txt"
                 with open(sidecar, "w", encoding="utf-8") as f:
                     f.write(script)
+                captions.save(out_path, caption_words)
 
-                self.history.add("videos", topic, out_path, level)
+                entry = self.history.add("videos", topic, out_path, level)
                 project = {
                     "dir": project_dir, "images": images, "scenes": scenes,
                     "narration_path": narration_final, "out_path": out_path,
                 }
-                self.progress_queue.put(("done_video", out_path, project))
+                self.progress_queue.put(("done_video", out_path, project, entry))
             else:
                 work_dir = os.path.join(config.APP_DIR, "tmp", gen_id)
                 os.makedirs(work_dir, exist_ok=True)
                 try:
                     self._progress_cb(0, 1, "Writing podcast script...")
-                    script = ai_services.generate_podcast_script(topic, level, tier["chat_model"])
+                    script = ai_services.generate_podcast_script(topic, level, tier["chat_model"], style=style)
                     self.progress_queue.put(("script", script))
 
                     raw_audio = os.path.join(work_dir, "dialogue_raw.mp3")
+                    timeline = []
                     ai_services.generate_podcast_audio(
                         script, raw_audio, work_dir, tier["tts_model"],
                         progress_cb=self._progress_cb, cancel_event=self.cancel_event,
+                        timeline=timeline, calm_hosts=style.get("calm_hosts"),
                     )
 
                     out_path = os.path.join(config.PODCASTS_DIR, f"{gen_id}.mp3")
@@ -1042,9 +1474,10 @@ class ShikhaAIApp(ctk.CTk):
                     sidecar = os.path.splitext(out_path)[0] + ".txt"
                     with open(sidecar, "w", encoding="utf-8") as f:
                         f.write(script)
+                    captions.save(out_path, captions.words_from_timeline(timeline))
 
-                    self.history.add("podcasts", topic, out_path, level)
-                    self.progress_queue.put(("done_podcast", out_path))
+                    entry = self.history.add("podcasts", topic, out_path, level)
+                    self.progress_queue.put(("done_podcast", out_path, entry))
                 finally:
                     self._cleanup_dir(work_dir)
 
@@ -1054,6 +1487,17 @@ class ShikhaAIApp(ctk.CTk):
             self.progress_queue.put(("error", str(exc)))
         except Exception as exc:  # last-resort safety net so the UI never hard-freezes
             self.progress_queue.put(("error", f"Unexpected error: {exc}"))
+
+    def _time_video_captions(self, script, narration_path, tier):
+        """Word timings for a video's captions (worker thread). Falls back to an
+        estimate from the script if transcription fails - captions should never
+        cost the learner a finished video."""
+        try:
+            timed = ai_services.transcribe_word_timings(narration_path, tier["transcribe_model"], self.cancel_event)
+            return captions.align_to_script(script, timed)
+        except ai_services.GenerationError as exc:
+            print(f"[ShikhaAI] Estimating caption timing instead: {exc}", file=sys.stderr)
+            return captions.estimate_words(script, 0, ai_services.audio_duration(narration_path))
 
     @staticmethod
     def _cleanup_dir(work_dir):
@@ -1088,20 +1532,23 @@ class ShikhaAIApp(ctk.CTk):
         elif kind == "script":
             self._set_script_text(message[1])
         elif kind == "done_video":
-            _, out_path, project = message
+            _, out_path, project, entry = message
             self._set_generating_ui(False)
             self.status_label.configure(text="Done!")
             self.toasts.show("Video ready!", kind="success")
             self.last_video_path = out_path
             self.current_video_project = project
+            self._set_current_lesson(dict(entry, kind="videos"))
             self._render_storyboard(project)
             self._load_video(out_path)
         elif kind == "done_podcast":
+            _, out_path, entry = message
             self._set_generating_ui(False)
             self.status_label.configure(text="Done!")
             self.toasts.show("Podcast ready!", kind="success")
-            self.last_podcast_path = message[1]
-            self._load_podcast(message[1], os.path.basename(message[1]))
+            self.last_podcast_path = out_path
+            self._set_current_lesson(dict(entry, kind="podcasts"))
+            self._load_podcast(out_path, os.path.basename(out_path))
         elif kind == "scene_regenerated":
             _, index, out_path = message
             self._set_generating_ui(False)
@@ -1181,12 +1628,14 @@ class ShikhaAIApp(ctk.CTk):
     # ------------------------------------------------------------------
     def _load_video(self, path):
         self.last_video_path = path
+        self._load_captions("video", path)
         if not self.video_player.available:
             self.status_label.configure(text="Saved (playback engine unavailable - open the file manually).")
             return
         self.video_player.attach(self.video_surface)
         self.video_player.load(path)
         self.video_player.play()
+        self.video_player.set_rate(self.video_speed)
         self.play_btn.configure(state="normal")
         self.pause_btn.configure(state="normal")
         self.resume_btn.configure(state="disabled")
@@ -1198,6 +1647,7 @@ class ShikhaAIApp(ctk.CTk):
         self.video_player.attach(self.video_surface)
         self.video_player.load(self.last_video_path)
         self.video_player.play()
+        self.video_player.set_rate(self.video_speed)
         self.pause_btn.configure(state="normal")
         self.resume_btn.configure(state="disabled")
 
@@ -1207,9 +1657,14 @@ class ShikhaAIApp(ctk.CTk):
         self.resume_btn.configure(state="normal")
 
     def _resume_video(self):
+        self.video_player.set_rate(self.video_speed)
         self.video_player.play()
         self.pause_btn.configure(state="normal")
         self.resume_btn.configure(state="disabled")
+
+    def _set_video_speed(self, speed_str):
+        self.video_speed = float(speed_str)
+        self.video_player.set_rate(self.video_speed)
 
     # ------------------------------------------------------------------
     # Podcast playback
@@ -1217,6 +1672,7 @@ class ShikhaAIApp(ctk.CTk):
     def _load_podcast(self, path, name):
         self.last_podcast_path = path
         self.podcast_name_label.configure(text=name)
+        self._load_captions("podcast", path)
         if not self.podcast_player.available:
             self.status_label.configure(text="Saved (playback engine unavailable - open the file manually).")
             return
@@ -1251,3 +1707,67 @@ class ShikhaAIApp(ctk.CTk):
     def _set_podcast_speed(self, speed_str):
         self.podcast_speed = float(speed_str)
         self.podcast_player.set_rate(self.podcast_speed)
+
+    # ------------------------------------------------------------------
+    # Captions (main thread only)
+    # ------------------------------------------------------------------
+    def _load_captions(self, kind, media_path):
+        """Pick up a lesson's captions as it's loaded for playback. Older lessons
+        have no captions file; those get an estimate once VLC knows the length."""
+        words = captions.load(media_path)
+        self.caption_words[kind] = words
+        self._caption_pending[kind] = None if words else media_path
+        self._rebuild_caption_track(kind)
+
+    def _rebuild_caption_track(self, kind):
+        words = self.caption_words[kind]
+        self.caption_tracks[kind] = (
+            captions.CaptionTrack(words, int(self.settings.get("caption_words"))) if words else None
+        )
+
+    def _estimate_captions(self, kind, media_path, duration):
+        script_path = os.path.splitext(media_path)[0] + ".txt"
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                script = f.read()
+        except OSError:
+            return None
+        if kind == "podcast":
+            turns = ai_services.parse_podcast_lines(script)
+            return captions.estimate_turns(turns, 0, duration) or None
+        return captions.estimate_words(script, 0, duration) or None
+
+    def _tick_captions(self):
+        try:
+            self._update_captions()
+        finally:
+            self.after(100, self._tick_captions)
+
+    def _update_captions(self):
+        if not self.settings.get("captions_enabled"):
+            return
+        kind = self.mode
+        player = self.video_player if kind == "video" else self.podcast_player
+        bar = self.video_captions if kind == "video" else self.podcast_captions
+
+        if self._caption_pending[kind]:
+            length = player.get_length()
+            if length > 0:
+                media_path, self._caption_pending[kind] = self._caption_pending[kind], None
+                self.caption_words[kind] = self._estimate_captions(kind, media_path, length)
+                self._rebuild_caption_track(kind)
+
+        t = player.get_time()
+        if t is None or player.has_ended():
+            bar.clear()
+            return
+        track = self.caption_tracks[kind]
+        if track is None:
+            if not self._caption_pending[kind]:
+                bar.clear("Captions aren't available for this lesson.")
+            return
+        cue_index, word_index = track.at(t)
+        if cue_index is None:
+            bar.clear("")
+        else:
+            bar.show(track.cues[cue_index], word_index)

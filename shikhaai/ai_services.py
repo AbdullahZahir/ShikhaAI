@@ -3,6 +3,7 @@ All calls out to OpenAI, plus the moviepy assembly step, live here.
 """
 
 import base64
+import json
 import os
 import re
 import uuid
@@ -38,6 +39,62 @@ def get_client():
             "and restart the app."
         )
     return OpenAI(api_key=api_key)
+
+
+# Reasoning models (GPT-5 family, o-series) spend part of their token budget
+# thinking before they answer, so they get extra room on top of the answer's.
+_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+_REASONING_HEADROOM = 2000
+
+
+def _chat(client, model, messages, max_tokens, **kwargs):
+    """One chat completion, returning the reply text.
+
+    Uses `max_completion_tokens`, which every current chat model accepts -
+    GPT-5-family models reject the older `max_tokens` outright.
+    """
+    if model.startswith(_REASONING_PREFIXES):
+        kwargs.setdefault("reasoning_effort", "low")
+        max_tokens += _REASONING_HEADROOM
+    response = client.chat.completions.create(
+        model=model, messages=messages, max_completion_tokens=max_tokens, **kwargs,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+# --------------------------------------------------------------------------
+# Lesson style (from the Accessibility page)
+# --------------------------------------------------------------------------
+def lesson_style_rules(style):
+    """Extra writing rules for the neurodivergent-friendly lesson options.
+
+    `style` is a dict of booleans: literal_language, predictable_structure,
+    bite_size (calm_hosts only affects podcasts - see generate_podcast_script).
+    """
+    style = style or {}
+    rules = []
+    if style.get("literal_language"):
+        rules.append(
+            "Use clear, literal language: no idioms, sarcasm, exaggeration or figures of "
+            "speech. Say exactly what you mean, and explain each new word in plain terms "
+            "the first time it appears."
+        )
+    if style.get("predictable_structure"):
+        rules.append(
+            "Use a predictable structure: begin by saying what the lesson will cover, go "
+            "through the ideas in clearly signposted steps (first, next, then, finally), "
+            "and finish with a short recap of the main points."
+        )
+    if style.get("bite_size"):
+        rules.append(
+            "Keep it short and focused: about 150 words in total, one main idea per "
+            "paragraph, and short sentences."
+        )
+    return rules
+
+
+def _with_rules(text, rules):
+    return text + ("\n\n" + "\n".join(f"- {r}" for r in rules) if rules else "")
 
 
 # --------------------------------------------------------------------------
@@ -146,11 +203,11 @@ def parse_podcast_lines(script):
 # --------------------------------------------------------------------------
 # Script generation
 # --------------------------------------------------------------------------
-def generate_script(topic, level, model):
+def generate_script(topic, level, model, style=None):
     client = get_client()
     try:
-        response = client.chat.completions.create(
-            model=model,
+        text = _chat(
+            client, model,
             messages=[
                 {
                     "role": "system",
@@ -162,17 +219,17 @@ def generate_script(topic, level, model):
                 },
                 {
                     "role": "user",
-                    "content": (
+                    "content": _with_rules(
                         f"Write a narration script appropriate for a {level} student "
                         f"on this topic:\n\n{topic}\n\n"
                         "Keep paragraphs short (2-4 sentences) since each paragraph "
-                        "will be paired with one illustration."
+                        "will be paired with one illustration.",
+                        lesson_style_rules(style),
                     ),
                 },
             ],
             max_tokens=900,
         )
-        text = (response.choices[0].message.content or "").strip()
         if not text:
             raise GenerationError("The model returned an empty script. Try again.")
         return text
@@ -182,11 +239,19 @@ def generate_script(topic, level, model):
         raise GenerationError(f"Couldn't generate the script: {exc}") from exc
 
 
-def generate_podcast_script(topic, level, model):
+def generate_podcast_script(topic, level, model, style=None):
+    style = style or {}
+    rules = lesson_style_rules({**style, "bite_size": False})
+    if style.get("calm_hosts"):
+        rules.append(
+            "Keep both hosts calm and gentle: no shouting, teasing, interrupting or "
+            "sudden jokes. Any humor is light and easy to follow."
+        )
+    exchanges = "10-14" if style.get("bite_size") else "20-30"
     client = get_client()
     try:
-        response = client.chat.completions.create(
-            model=model,
+        text = _chat(
+            client, model,
             messages=[
                 {
                     "role": "system",
@@ -198,20 +263,20 @@ def generate_podcast_script(topic, level, model):
                 },
                 {
                     "role": "user",
-                    "content": (
+                    "content": _with_rules(
                         "Create a podcast-style dialogue between two AI hosts, "
                         "Shimmer and Echo. Shimmer is energetic and playful; Echo "
                         "is calm and thoughtful. The topic is: "
                         f"{topic} (for a {level} student). Make it engaging with "
                         "back-and-forth exchanges, light humor, and real-life "
-                        "examples. Aim for roughly 20-30 exchanges total. Every "
-                        "line must start with 'Shimmer:' or 'Echo:'."
+                        f"examples. Aim for roughly {exchanges} exchanges total. Every "
+                        "line must start with 'Shimmer:' or 'Echo:'.",
+                        rules,
                     ),
                 },
             ],
             max_tokens=1800,
         )
-        text = (response.choices[0].message.content or "").strip()
         if not parse_podcast_lines(text):
             raise GenerationError(
                 "The model didn't return recognizable Shimmer/Echo dialogue. Try again."
@@ -226,16 +291,25 @@ def generate_podcast_script(topic, level, model):
 # --------------------------------------------------------------------------
 # Image generation (GPT Image family)
 # --------------------------------------------------------------------------
-def _generate_one_image_bytes(client, model, quality, scene_text):
+# Sensory-friendly illustrations (Accessibility > "Calm illustrations").
+_CALM_VISUALS_STYLE = (
+    "Use soft, muted colors, a simple uncluttered composition with plenty of empty "
+    "space, and gentle lighting. No busy patterns, flashing effects or scary imagery. "
+)
+
+
+def _generate_one_image_bytes(client, model, quality, scene_text, calm_visuals=False):
     prompt = (
         "A clean, family-friendly educational illustration for this scene "
-        f"(no text or captions in the image): {scene_text}"
+        f"(no text or captions in the image). {_CALM_VISUALS_STYLE if calm_visuals else ''}"
+        f"Scene: {scene_text}"
     )[:32000]
     result = client.images.generate(model=model, prompt=prompt, size="1024x1024", quality=quality, n=1)
     return base64.b64decode(result.data[0].b64_json)
 
 
-def generate_images(script, work_dir, model, quality, max_scenes, progress_cb=None, cancel_event=None):
+def generate_images(script, work_dir, model, quality, max_scenes, progress_cb=None, cancel_event=None,
+                    calm_visuals=False):
     """Returns (image_paths, scene_texts) - scene_texts is kept so a single
     scene's image can be regenerated later without redoing the chunking."""
     client = get_client()
@@ -248,7 +322,7 @@ def generate_images(script, work_dir, model, quality, max_scenes, progress_cb=No
             progress_cb(i, len(scenes), f"Illustrating scene {i + 1} of {len(scenes)}...")
         path = os.path.join(work_dir, f"frame_{i:03d}.png")
         try:
-            image_bytes = _generate_one_image_bytes(client, model, quality, scene_text)
+            image_bytes = _generate_one_image_bytes(client, model, quality, scene_text, calm_visuals)
             with open(path, "wb") as f:
                 f.write(image_bytes)
             image_paths.append(path)
@@ -260,11 +334,11 @@ def generate_images(script, work_dir, model, quality, max_scenes, progress_cb=No
     return image_paths, scenes
 
 
-def regenerate_scene_image(scene_text, image_path, model, quality):
+def regenerate_scene_image(scene_text, image_path, model, quality, calm_visuals=False):
     """Redo a single storyboard scene's illustration in place (same file path)."""
     client = get_client()
     try:
-        image_bytes = _generate_one_image_bytes(client, model, quality, scene_text)
+        image_bytes = _generate_one_image_bytes(client, model, quality, scene_text, calm_visuals)
         with open(image_path, "wb") as f:
             f.write(image_bytes)
         return image_path
@@ -343,25 +417,40 @@ def generate_narration_audio(script, out_path, work_dir, model, voice, progress_
                 pass
 
 
-def generate_podcast_audio(script, out_path, work_dir, model, progress_cb=None, cancel_event=None):
-    """Turn parsed Shimmer/Echo dialogue into one concatenated podcast mp3."""
+# Used instead of each host's usual delivery when "Calm podcast hosts" is on.
+_CALM_HOST_INSTRUCTIONS = (
+    "Speak warmly and gently at a steady, even pace. Keep your volume and pitch "
+    "consistent - no sudden changes, shouting or exaggerated excitement."
+)
+
+
+def generate_podcast_audio(script, out_path, work_dir, model, progress_cb=None, cancel_event=None,
+                           timeline=None, calm_hosts=False):
+    """Turn parsed Shimmer/Echo dialogue into one concatenated podcast mp3.
+
+    If `timeline` is a list, a (speaker, text, start_seconds, end_seconds)
+    tuple is appended to it for every turn - used to time the captions.
+    """
     client = get_client()
     turns = parse_podcast_lines(script)
     if not turns:
         raise GenerationError("Could not find any Shimmer/Echo dialogue lines in the script.")
 
     clips, tmp_files = [], []
+    elapsed = 0.0
     try:
         for i, (speaker, text) in enumerate(turns):
             _check_cancel(cancel_event)
             if progress_cb:
                 progress_cb(i, len(turns), f"Recording line {i + 1} of {len(turns)} ({speaker})...")
             host = config.PODCAST_HOSTS.get(speaker, config.PODCAST_HOSTS["Echo"])
+            instructions = _CALM_HOST_INSTRUCTIONS if calm_hosts else host["instructions"]
+            turn_start = elapsed
             for sub_text in chunk_text_by_length(text, config.PODCAST_LINE_CHUNK_CHARS):
                 try:
                     tmp_path = _speak_chunk(
                         client, model, host["voice"], sub_text, work_dir,
-                        instructions=host["instructions"],
+                        instructions=instructions,
                     )
                 except GenerationCancelled:
                     raise
@@ -369,6 +458,9 @@ def generate_podcast_audio(script, out_path, work_dir, model, progress_cb=None, 
                     raise GenerationError(f"Narration failed on line {i + 1}: {exc}") from exc
                 tmp_files.append(tmp_path)
                 clips.append(AudioFileClip(tmp_path))
+                elapsed += clips[-1].duration
+            if timeline is not None:
+                timeline.append((speaker, text, turn_start, elapsed))
 
         if not clips:
             raise GenerationError("No audio was generated for this podcast.")
@@ -387,6 +479,128 @@ def generate_podcast_audio(script, out_path, work_dir, model, progress_cb=None, 
                 os.remove(p)
             except OSError:
                 pass
+
+
+def audio_duration(path):
+    clip = AudioFileClip(path)
+    try:
+        return clip.duration
+    finally:
+        clip.close()
+
+
+# --------------------------------------------------------------------------
+# Caption timing
+# --------------------------------------------------------------------------
+def transcribe_word_timings(audio_path, model, cancel_event=None):
+    """Word-level timestamps for a narration track: [{"w", "s", "e"}, ...].
+
+    Costs a fraction of a cent per minute of audio. The words come back
+    without punctuation - captions.align_to_script() puts the script's own
+    wording back on top of these timings.
+    """
+    _check_cancel(cancel_event)
+    client = get_client()
+    try:
+        with open(audio_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model=model, file=f, response_format="verbose_json",
+                timestamp_granularities=["word"],
+            )
+    except Exception as exc:
+        raise GenerationError(f"Couldn't time the captions: {exc}") from exc
+    words = [
+        {"w": w.word.strip(), "s": float(w.start), "e": float(w.end)}
+        for w in (getattr(result, "words", None) or []) if w.word.strip()
+    ]
+    if not words:
+        raise GenerationError("Couldn't time the captions: the transcription had no words.")
+    return words
+
+
+# --------------------------------------------------------------------------
+# Quiz questions
+# --------------------------------------------------------------------------
+def _clean_quiz_questions(data):
+    """Keep only well-formed questions: text, exactly 4 distinct choices, a valid answer."""
+    questions = []
+    for q in (data or {}).get("questions", []):
+        try:
+            question = str(q["question"]).strip()
+            choices = [str(c).strip() for c in q["choices"]]
+            answer = int(q["answer"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not question or len(choices) != 4 or not all(choices) or len(set(choices)) != 4:
+            continue
+        if not 0 <= answer < 4:
+            continue
+        questions.append({
+            "question": question,
+            "choices": choices,
+            "answer": answer,
+            "explanation": str(q.get("explanation", "")).strip(),
+        })
+    return questions
+
+
+def generate_quiz(level, model, num_questions, lesson_text=None, topic=None, style=None):
+    """Multiple-choice questions for a lesson's script (or, failing that, a bare
+    topic). Returns [{"question", "choices": [4 strings], "answer": 0-3,
+    "explanation"}, ...]."""
+    if lesson_text:
+        source = (
+            "Base every question only on what this lesson teaches, so a student who "
+            f"followed it can answer them all:\n\n{lesson_text[:12000]}"
+        )
+    else:
+        source = f"The topic is: {topic}"
+
+    rules = [
+        "Each question has exactly 4 answer choices and exactly one correct answer.",
+        "Wrong choices should be believable but clearly wrong to a student who understood the lesson.",
+        "Never use 'all of the above' or 'none of the above'.",
+        "Keep questions and choices short and easy to read.",
+        "Mix easier recall questions with a few that check understanding.",
+    ]
+    if (style or {}).get("literal_language"):
+        rules.append("Use clear, literal wording - no idioms, trick questions or double negatives.")
+
+    client = get_client()
+    try:
+        text = _chat(
+            client, model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You write fair, clear multiple-choice quiz questions that check "
+                        "whether a student understood a lesson. Reply with JSON only."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _with_rules(
+                        f"Write {num_questions} multiple-choice questions for a {level} "
+                        f"student.\n\n{source}\n\n"
+                        'Reply as JSON: {"questions": [{"question": "...", "choices": '
+                        '["...", "...", "...", "..."], "answer": <index 0-3 of the correct '
+                        'choice>, "explanation": "<one short sentence saying why>"}]}',
+                        rules,
+                    ),
+                },
+            ],
+            max_tokens=200 + 250 * num_questions,
+            response_format={"type": "json_object"},
+        )
+        questions = _clean_quiz_questions(json.loads(text))
+    except json.JSONDecodeError as exc:
+        raise GenerationError("The quiz came back in an unexpected format. Try again.") from exc
+    except Exception as exc:
+        raise GenerationError(f"Couldn't generate the quiz: {exc}") from exc
+    if not questions:
+        raise GenerationError("The model didn't return any usable quiz questions. Try again.")
+    return questions[:num_questions]
 
 
 # --------------------------------------------------------------------------
